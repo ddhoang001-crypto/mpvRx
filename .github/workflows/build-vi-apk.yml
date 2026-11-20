@@ -1,0 +1,224 @@
+name: Build Vietnamese APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-vi-apk.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-vi:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install translator
+        run: pip install --quiet deep-translator
+
+      - name: Generate Vietnamese strings.xml
+        run: |
+          cat << 'EOF' > translate_vi.py
+          import os, re, time
+          import xml.etree.ElementTree as ET
+          from deep_translator import GoogleTranslator
+
+          SRC = "app/src/main/res/values/strings.xml"
+          DST_DIR = "app/src/main/res/values-vi"
+          DST = os.path.join(DST_DIR, "strings.xml")
+
+          raw = open(SRC, encoding="utf-8").read()
+          for prefix, uri in re.findall(r'xmlns:([a-zA-Z0-9_-]+)="([^"]+)"', raw):
+              ET.register_namespace(prefix, uri)
+
+          tree = ET.parse(SRC)
+          root = tree.getroot()
+
+          FMT_RE = re.compile(r'%(?:\d+\$)?[-#+0,(]*\d*(?:\.\d+)?[sdifxXoeEgGcCbBhHaAtT%]')
+          PROTECT_RE = re.compile(r'\\u[0-9a-fA-F]{4}|\\[nt]|%(?:\d+\$)?[-#+0,(]*\d*(?:\.\d+)?[sdifxXoeEgGcCbBhHaAtT%]')
+          translator = GoogleTranslator(source="en", target="vi")
+
+          def should_skip(s):
+              if not s:
+                  return True
+              t = s.strip()
+              if not t or t.startswith("@") or t.startswith("?") or t.startswith("http"):
+                  return True
+              if not re.search(r'[A-Za-z]', t):
+                  return True
+              return False
+
+          def prepare(text):
+              orig = text
+              t = text.strip()
+              quoted = len(t) >= 2 and t[0] == '"' and t[-1] == '"'
+              inner = t[1:-1] if quoted else text
+              unesc = inner.replace("\\'", "'").replace('\\"', '"')
+              tokens = []
+              def repl(m):
+                  idx = len(tokens)
+                  tokens.append(m.group(0))
+                  return f"ZXQ{idx}ZXQ"
+              masked = PROTECT_RE.sub(repl, unesc)
+              masked = re.sub(r'\s*\r?\n\s*', ' ', masked).strip()
+              return orig, unesc, quoted, tokens, masked
+
+          def finalize(trans, orig, unesc, quoted, tokens):
+              if not trans:
+                  return orig
+              res = trans.replace("\r", " ").replace("\n", " ")
+              for i, tok in enumerate(tokens):
+                  res = re.sub(rf'ZXQ\s*{i}\s*ZXQ', lambda _, v=tok: v, res, flags=re.IGNORECASE)
+              if re.search(r'ZXQ\s*\d+\s*ZXQ', res, re.IGNORECASE):
+                  return orig
+              if sorted(FMT_RE.findall(res)) != sorted(FMT_RE.findall(unesc)):
+                  return orig
+              res = res.replace("\\'", "'").replace('\\"', '"')
+              if quoted:
+                  res = '"' + res.replace('"', '\\"') + '"'
+              else:
+                  res = res.replace("'", "\\'").replace('"', '\\"')
+                  if res.startswith("@") or res.startswith("?"):
+                      res = "\\" + res
+              return res
+
+          def translate_batch(lines):
+              if not lines:
+                  return []
+              joined = "\n".join(lines)
+              for attempt in range(3):
+                  try:
+                      out = translator.translate(joined)
+                      if out:
+                          parts = out.split("\n")
+                          if len(parts) == len(lines):
+                              return parts
+                      break
+                  except Exception:
+                      time.sleep(1.5 * (attempt + 1))
+              if len(lines) == 1:
+                  return lines
+              mid = len(lines) // 2
+              return translate_batch(lines[:mid]) + translate_batch(lines[mid:])
+
+          items = []
+          for elem in list(root):
+              if elem.attrib.get("translatable") == "false":
+                  root.remove(elem)
+                  continue
+              if elem.tag == "string" and len(elem) == 0 and not should_skip(elem.text):
+                  items.append(elem)
+              elif elem.tag in ("string-array", "plurals"):
+                  for child in elem:
+                      if child.tag == "item" and len(child) == 0 and not should_skip(child.text):
+                          items.append(child)
+
+          prepared = [prepare(e.text) for e in items]
+          translated_masked = []
+          batch, batch_len = [], 0
+          for p in prepared:
+              m = p[4]
+              if batch and (len(batch) >= 25 or batch_len + len(m) > 3000):
+                  translated_masked.extend(translate_batch(batch))
+                  batch, batch_len = [], 0
+                  time.sleep(0.2)
+              batch.append(m)
+              batch_len += len(m) + 1
+          if batch:
+              translated_masked.extend(translate_batch(batch))
+
+          changed = 0
+          for elem, p, trans in zip(items, prepared, translated_masked):
+              final = finalize(trans, p[0], p[1], p[2], p[3])
+              if final != p[0]:
+                  changed += 1
+              elem.text = final
+
+          os.makedirs(DST_DIR, exist_ok=True)
+          tree.write(DST, encoding="utf-8", xml_declaration=True)
+          ET.parse(DST)
+          print(f"Translated {changed}/{len(items)} strings into {DST}")
+          EOF
+          python3 translate_vi.py
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Install Android Compile SDK 37.2
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.2"
+
+      - name: Build Standard Release APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleStandardRelease --stacktrace --no-daemon --max-workers=2
+
+      - name: Sign Release APKs
+        run: |
+          mkdir -p signed_apks
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME/build-tools/"* | sort -V | tail -n 1)
+          keytool -genkeypair -v \
+            -keystore vi-release.keystore \
+            -alias mpvrx_vi \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass mpvrx123456 -keypass mpvrx123456 \
+            -dname "CN=mpvRx Vietnamese, OU=Community, O=mpvRx, L=Hanoi, S=HN, C=VN"
+
+          shopt -s nullglob
+          APKS=(app/build/outputs/apk/standard/release/*.apk)
+          if [ ${#APKS[@]} -eq 0 ]; then
+            mapfile -t APKS < <(find app/build/outputs/apk -name "*.apk")
+          fi
+
+          for apk in "${APKS[@]}"; do
+            base=$(basename "$apk" .apk | sed 's/-unsigned$//')
+            aligned="signed_apks/${base}-aligned.apk"
+            signed="signed_apks/${base}-vi-signed.apk"
+            "$BUILD_TOOLS/zipalign" -p -f 4 "$apk" "$aligned"
+            "$BUILD_TOOLS/apksigner" sign \
+              --ks vi-release.keystore \
+              --ks-key-alias mpvrx_vi \
+              --ks-pass pass:mpvrx123456 \
+              --key-pass pass:mpvrx123456 \
+              --out "$signed" \
+              "$aligned"
+            rm -f "$aligned"
+            "$BUILD_TOOLS/apksigner" verify "$signed"
+          done
+          ls -lh signed_apks/
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpvRx-Vietnamese-APK
+          path: |
+            signed_apks/*.apk
+            app/src/main/res/values-vi/strings.xml
+
+      - name: Publish Release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view vi-latest >/dev/null 2>&1; then
+            gh release upload vi-latest signed_apks/*.apk --clobber
+          else
+            gh release create vi-latest signed_apks/*.apk \
+              --title "mpvRx Tiếng Việt" \
+              --notes "Bản dựng mpvRx đã được Việt hóa giao diện và ký sẵn APK để cài trực tiếp lên Android."
+          fi
