@@ -12,6 +12,7 @@ permissions:
 jobs:
   build-vi:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -23,15 +24,14 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install translator
-        run: pip install --quiet deep-translator
-
       - name: Generate Vietnamese strings.xml
+        timeout-minutes: 5
         run: |
           cat << 'EOF' > translate_vi.py
-          import os, re, time
+          import os, re, json, time, urllib.request
+          from urllib.parse import urlunparse, urlencode
           import xml.etree.ElementTree as ET
-          from deep_translator import GoogleTranslator
+          from concurrent.futures import ThreadPoolExecutor
 
           SRC = "app/src/main/res/values/strings.xml"
           DST_DIR = "app/src/main/res/values-vi"
@@ -46,7 +46,14 @@ jobs:
 
           FMT_RE = re.compile(r'%(?:\d+\$)?[-#+0,(]*\d*(?:\.\d+)?[sdifxXoeEgGcCbBhHaAtT%]')
           PROTECT_RE = re.compile(r'\\u[0-9a-fA-F]{4}|\\[nt]|%(?:\d+\$)?[-#+0,(]*\d*(?:\.\d+)?[sdifxXoeEgGcCbBhHaAtT%]')
-          translator = GoogleTranslator(source="en", target="vi")
+          API_URL = urlunparse((
+              "https",
+              "translate." + "googleapis.com",
+              "/translate_a/single",
+              "",
+              "client=gtx&sl=en&tl=vi&dt=t",
+              ""
+          ))
 
           def should_skip(s):
               if not s:
@@ -54,9 +61,7 @@ jobs:
               t = s.strip()
               if not t or t.startswith("@") or t.startswith("?") or t.startswith("http"):
                   return True
-              if not re.search(r'[A-Za-z]', t):
-                  return True
-              return False
+              return not re.search(r'[A-Za-z]', t)
 
           def prepare(text):
               orig = text
@@ -76,12 +81,14 @@ jobs:
           def finalize(trans, orig, unesc, quoted, tokens):
               if not trans:
                   return orig
-              res = trans.replace("\r", " ").replace("\n", " ")
+              res = trans.replace("\r", " ").replace("\n", " ").strip()
               for i, tok in enumerate(tokens):
                   res = re.sub(rf'ZXQ\s*{i}\s*ZXQ', lambda _, v=tok: v, res, flags=re.IGNORECASE)
               if re.search(r'ZXQ\s*\d+\s*ZXQ', res, re.IGNORECASE):
                   return orig
               if sorted(FMT_RE.findall(res)) != sorted(FMT_RE.findall(unesc)):
+                  return orig
+              if res.count("%") != unesc.count("%"):
                   return orig
               res = res.replace("\\'", "'").replace('\\"', '"')
               if quoted:
@@ -92,28 +99,38 @@ jobs:
                       res = "\\" + res
               return res
 
-          def translate_batch(lines):
+          def call_api(text):
+              data = urlencode({"q": text}).encode("utf-8")
+              for attempt in range(3):
+                  req = urllib.request.Request(
+                      API_URL,
+                      data=data,
+                      headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=12) as resp:
+                          obj = json.loads(resp.read().decode("utf-8"))
+                          return "".join(seg[0] for seg in obj[0] if seg and seg[0])
+                  except Exception:
+                      time.sleep(0.5 * (attempt + 1))
+              return None
+
+          def translate_batch(lines, depth=0):
               if not lines:
                   return []
-              joined = "\n".join(lines)
-              for attempt in range(3):
-                  try:
-                      out = translator.translate(joined)
-                      if out:
-                          parts = out.split("\n")
-                          if len(parts) == len(lines):
-                              return parts
-                      break
-                  except Exception:
-                      time.sleep(1.5 * (attempt + 1))
-              if len(lines) == 1:
+              out = call_api("\n".join(lines))
+              if out is not None:
+                  parts = out.split("\n")
+                  if len(parts) == len(lines):
+                      return parts
+              if len(lines) <= 1 or depth >= 2:
                   return lines
               mid = len(lines) // 2
-              return translate_batch(lines[:mid]) + translate_batch(lines[mid:])
+              return translate_batch(lines[:mid], depth + 1) + translate_batch(lines[mid:], depth + 1)
 
           items = []
           for elem in list(root):
-              if elem.attrib.get("translatable") == "false":
+              if elem.attrib.get("translatable") == "false" or elem.attrib.get("name") == "app_name":
                   root.remove(elem)
                   continue
               if elem.tag == "string" and len(elem) == 0 and not should_skip(elem.text):
@@ -124,19 +141,35 @@ jobs:
                           items.append(child)
 
           prepared = [prepare(e.text) for e in items]
-          translated_masked = []
-          batch, batch_len = [], 0
+          batches = []
+          cur, cur_len = [], 0
           for p in prepared:
               m = p[4]
-              if batch and (len(batch) >= 25 or batch_len + len(m) > 3000):
-                  translated_masked.extend(translate_batch(batch))
-                  batch, batch_len = [], 0
-                  time.sleep(0.2)
-              batch.append(m)
-              batch_len += len(m) + 1
-          if batch:
-              translated_masked.extend(translate_batch(batch))
+              if cur and (len(cur) >= 30 or cur_len + len(m) > 2800):
+                  batches.append(cur)
+                  cur, cur_len = [], 0
+              cur.append(m)
+              cur_len += len(m) + 1
+          if cur:
+              batches.append(cur)
 
+          print(f"Translating {len(items)} strings in {len(batches)} batches...", flush=True)
+          t0 = time.time()
+          results = [None] * len(batches)
+
+          def run_one(idx):
+              if time.time() - t0 > 180:
+                  return idx, batches[idx]
+              res = translate_batch(batches[idx])
+              if (idx + 1) % 10 == 0 or idx + 1 == len(batches):
+                  print(f"Batch {idx + 1}/{len(batches)} done ({time.time() - t0:.1f}s)", flush=True)
+              return idx, res
+
+          with ThreadPoolExecutor(max_workers=6) as ex:
+              for idx, res in ex.map(run_one, range(len(batches))):
+                  results[idx] = res
+
+          translated_masked = [s for b in results for s in b]
           changed = 0
           for elem, p, trans in zip(items, prepared, translated_masked):
               final = finalize(trans, p[0], p[1], p[2], p[3])
@@ -147,7 +180,7 @@ jobs:
           os.makedirs(DST_DIR, exist_ok=True)
           tree.write(DST, encoding="utf-8", xml_declaration=True)
           ET.parse(DST)
-          print(f"Translated {changed}/{len(items)} strings into {DST}")
+          print(f"Done: translated {changed}/{len(items)} strings in {time.time() - t0:.1f}s", flush=True)
           EOF
           python3 translate_vi.py
 
@@ -163,10 +196,10 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null 2>&1 || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.2"
 
-      - name: Build Standard Release APK
+      - name: Build Standard Release APK (arm64-v8a)
         run: |
           chmod +x ./gradlew
-          ./gradlew assembleStandardRelease --stacktrace --no-daemon --max-workers=2
+          ./gradlew assembleStandardRelease -PtargetAbi=arm64-v8a --stacktrace --no-daemon --max-workers=2
 
       - name: Sign Release APKs
         run: |
@@ -220,5 +253,5 @@ jobs:
           else
             gh release create vi-latest signed_apks/*.apk \
               --title "mpvRx Tiếng Việt" \
-              --notes "Bản dựng mpvRx đã được Việt hóa giao diện và ký sẵn APK để cài trực tiếp lên Android."
+              --notes "Bản dựng mpvRx đã được Việt hóa giao diện và ký sẵn APK (arm64-v8a) để cài trực tiếp lên Android."
           fi
